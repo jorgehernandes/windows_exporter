@@ -4,24 +4,46 @@
 package collector
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
+	"sort"
+	"strings"
 
-	"github.com/prometheus-community/windows_exporter/log"
+	"github.com/alecthomas/kingpin/v2"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sys/windows/registry"
-	"gopkg.in/alecthomas/kingpin.v2"
 )
 
-func init() {
-	registerCollector("iis", NewIISCollector, "Web Service", "APP_POOL_WAS", "Web Service Cache", "W3SVC_W3WP", "HTTP Service Request Queues")
-}
+const (
+	FlagIISSiteOldExclude = "collector.iis.site-blacklist"
+	FlagIISSiteOldInclude = "collector.iis.site-whitelist"
+	FlagIISAppOldExclude  = "collector.iis.app-blacklist"
+	FlagIISAppOldInclude  = "collector.iis.app-whitelist"
+
+	FlagIISSiteExclude = "collector.iis.site-exclude"
+	FlagIISSiteInclude = "collector.iis.site-include"
+	FlagIISAppExclude  = "collector.iis.app-exclude"
+	FlagIISAppInclude  = "collector.iis.app-include"
+)
 
 var (
-	siteWhitelist = kingpin.Flag("collector.iis.site-whitelist", "Regexp of sites to whitelist. Site name must both match whitelist and not match blacklist to be included.").Default(".+").String()
-	siteBlacklist = kingpin.Flag("collector.iis.site-blacklist", "Regexp of sites to blacklist. Site name must both match whitelist and not match blacklist to be included.").String()
-	appWhitelist  = kingpin.Flag("collector.iis.app-whitelist", "Regexp of apps to whitelist. App name must both match whitelist and not match blacklist to be included.").Default(".+").String()
-	appBlacklist  = kingpin.Flag("collector.iis.app-blacklist", "Regexp of apps to blacklist. App name must both match whitelist and not match blacklist to be included.").String()
+	oldSiteInclude *string
+	oldSiteExclude *string
+	oldAppInclude  *string
+	oldAppExclude  *string
+
+	siteInclude *string
+	siteExclude *string
+	appInclude  *string
+	appExclude  *string
+
+	siteIncludeSet bool
+	siteExcludeSet bool
+	appIncludeSet  bool
+	appExcludeSet  bool
 )
 
 type simple_version struct {
@@ -29,31 +51,31 @@ type simple_version struct {
 	minor uint64
 }
 
-func getIISVersion() simple_version {
+func getIISVersion(logger log.Logger) simple_version {
 	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\InetStp\`, registry.QUERY_VALUE)
 	if err != nil {
-		log.Warn("Couldn't open registry to determine IIS version:", err)
+		_ = level.Warn(logger).Log("msg", "Couldn't open registry to determine IIS version", "err", err)
 		return simple_version{}
 	}
 	defer func() {
 		err = k.Close()
 		if err != nil {
-			log.Warnf("Failed to close registry key: %v", err)
+			_ = level.Warn(logger).Log("msg", fmt.Sprintf("Failed to close registry key"), "err", err)
 		}
 	}()
 
 	major, _, err := k.GetIntegerValue("MajorVersion")
 	if err != nil {
-		log.Warn("Couldn't open registry to determine IIS version:", err)
+		_ = level.Warn(logger).Log("msg", "Couldn't open registry to determine IIS version", "err", err)
 		return simple_version{}
 	}
 	minor, _, err := k.GetIntegerValue("MinorVersion")
 	if err != nil {
-		log.Warn("Couldn't open registry to determine IIS version:", err)
+		_ = level.Warn(logger).Log("msg", "Couldn't open registry to determine IIS version", "err", err)
 		return simple_version{}
 	}
 
-	log.Debugf("Detected IIS %d.%d\n", major, minor)
+	_ = level.Debug(logger).Log("msg", fmt.Sprintf("Detected IIS %d.%d\n", major, minor))
 
 	return simple_version{
 		major: major,
@@ -62,6 +84,7 @@ func getIISVersion() simple_version {
 }
 
 type IISCollector struct {
+	logger log.Logger
 	// Web Service
 	CurrentAnonymousUsers               *prometheus.Desc
 	CurrentBlockedAsyncIORequests       *prometheus.Desc
@@ -69,6 +92,7 @@ type IISCollector struct {
 	CurrentConnections                  *prometheus.Desc
 	CurrentISAPIExtensionRequests       *prometheus.Desc
 	CurrentNonAnonymousUsers            *prometheus.Desc
+	ServiceUptime                       *prometheus.Desc
 	TotalBytesReceived                  *prometheus.Desc
 	TotalBytesSent                      *prometheus.Desc
 	TotalAnonymousUsers                 *prometheus.Desc
@@ -85,8 +109,8 @@ type IISCollector struct {
 	TotalNotFoundErrors                 *prometheus.Desc
 	TotalRejectedAsyncIORequests        *prometheus.Desc
 
-	siteWhitelistPattern *regexp.Regexp
-	siteBlacklistPattern *regexp.Regexp
+	siteIncludePattern *regexp.Regexp
+	siteExcludePattern *regexp.Regexp
 
 	// APP_POOL_WAS
 	CurrentApplicationPoolState        *prometheus.Desc
@@ -192,22 +216,97 @@ type IISCollector struct {
 	RequestQueues_CurrentQueueSize *prometheus.Desc
 	RequestQueues_RejectedRequest  *prometheus.Desc
 
-	appWhitelistPattern *regexp.Regexp
-	appBlacklistPattern *regexp.Regexp
+	appIncludePattern *regexp.Regexp
+	appExcludePattern *regexp.Regexp
 
 	iis_version simple_version
 }
 
-func NewIISCollector() (Collector, error) {
+func newIISCollectorFlags(app *kingpin.Application) {
+	oldSiteInclude = app.Flag(FlagIISSiteOldInclude, "DEPRECATED: Use --collector.iis.site-include").Hidden().String()
+	oldSiteExclude = app.Flag(FlagIISSiteOldExclude, "DEPRECATED: Use --collector.iis.site-exclude").Hidden().String()
+	oldAppInclude = app.Flag(FlagIISAppOldInclude, "DEPRECATED: Use --collector.iis.app-include").Hidden().String()
+	oldAppExclude = app.Flag(FlagIISAppOldExclude, "DEPRECATED: Use --collector.iis.app-exclude").Hidden().String()
+
+	siteInclude = app.Flag(
+		FlagIISSiteInclude,
+		"Regexp of sites to include. Site name must both match include and not match exclude to be included.",
+	).Default(".+").PreAction(func(c *kingpin.ParseContext) error {
+		siteIncludeSet = true
+		return nil
+	}).String()
+
+	siteExclude = app.Flag(
+		FlagIISSiteExclude,
+		"Regexp of sites to exclude. Site name must both match include and not match exclude to be included.",
+	).Default("").PreAction(func(c *kingpin.ParseContext) error {
+		siteExcludeSet = true
+		return nil
+	}).String()
+
+	appInclude = app.Flag(
+		FlagIISAppInclude,
+		"Regexp of apps to include. App name must both match include and not match exclude to be included.",
+	).Default(".+").PreAction(func(c *kingpin.ParseContext) error {
+		appIncludeSet = true
+		return nil
+	}).String()
+
+	appExclude = app.Flag(
+		FlagIISAppExclude,
+		"Regexp of apps to include. App name must both match include and not match exclude to be included.",
+	).Default("").PreAction(func(c *kingpin.ParseContext) error {
+		siteExcludeSet = true
+		return nil
+	}).String()
+}
+
+func newIISCollector(logger log.Logger) (Collector, error) {
 	const subsystem = "iis"
+	logger = log.With(logger, "collector", subsystem)
+
+	if *oldSiteExclude != "" {
+		if !siteExcludeSet {
+			_ = level.Warn(logger).Log("msg", "--collector.iis.site-blacklist is DEPRECATED and will be removed in a future release, use --collector.iis.site-exclude")
+			*siteExclude = *oldSiteExclude
+		} else {
+			return nil, errors.New("--collector.iis.site-blacklist and --collector.iis.site-exclude are mutually exclusive")
+		}
+	}
+	if *oldSiteInclude != "" {
+		if !siteIncludeSet {
+			_ = level.Warn(logger).Log("msg", "--collector.iis.site-whitelist is DEPRECATED and will be removed in a future release, use --collector.iis.site-include")
+			*siteInclude = *oldSiteInclude
+		} else {
+			return nil, errors.New("--collector.iis.site-whitelist and --collector.iis.site-include are mutually exclusive")
+		}
+	}
+
+	if *oldAppExclude != "" {
+		if !appExcludeSet {
+			_ = level.Warn(logger).Log("msg", "--collector.iis.app-blacklist is DEPRECATED and will be removed in a future release, use --collector.iis.app-exclude")
+			*appExclude = *oldAppExclude
+		} else {
+			return nil, errors.New("--collector.iis.app-blacklist and --collector.iis.app-exclude are mutually exclusive")
+		}
+	}
+	if *oldAppInclude != "" {
+		if !appIncludeSet {
+			_ = level.Warn(logger).Log("msg", "--collector.iis.app-whitelist is DEPRECATED and will be removed in a future release, use --collector.iis.app-include")
+			*appInclude = *oldAppInclude
+		} else {
+			return nil, errors.New("--collector.iis.app-whitelist and --collector.iis.app-include are mutually exclusive")
+		}
+	}
 
 	return &IISCollector{
-		iis_version: getIISVersion(),
+		logger:      logger,
+		iis_version: getIISVersion(logger),
 
-		siteWhitelistPattern: regexp.MustCompile(fmt.Sprintf("^(?:%s)$", *siteWhitelist)),
-		siteBlacklistPattern: regexp.MustCompile(fmt.Sprintf("^(?:%s)$", *siteBlacklist)),
-		appWhitelistPattern:  regexp.MustCompile(fmt.Sprintf("^(?:%s)$", *appWhitelist)),
-		appBlacklistPattern:  regexp.MustCompile(fmt.Sprintf("^(?:%s)$", *appBlacklist)),
+		siteIncludePattern: regexp.MustCompile(fmt.Sprintf("^(?:%s)$", *siteInclude)),
+		siteExcludePattern: regexp.MustCompile(fmt.Sprintf("^(?:%s)$", *siteExclude)),
+		appIncludePattern:  regexp.MustCompile(fmt.Sprintf("^(?:%s)$", *appInclude)),
+		appExcludePattern:  regexp.MustCompile(fmt.Sprintf("^(?:%s)$", *appExclude)),
 
 		// Web Service
 		CurrentAnonymousUsers: prometheus.NewDesc(
@@ -243,6 +342,12 @@ func NewIISCollector() (Collector, error) {
 		CurrentNonAnonymousUsers: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "current_non_anonymous_users"),
 			"Number of users who currently have a non-anonymous connection using the Web service (WebService.CurrentNonAnonymousUsers)",
+			[]string{"site"},
+			nil,
+		),
+		ServiceUptime: prometheus.NewDesc(
+			prometheus.BuildFQName(Namespace, subsystem, "service_uptime"),
+			"Number of seconds the WebService is up (WebService.ServiceUptime)",
 			[]string{"site"},
 			nil,
 		),
@@ -420,25 +525,25 @@ func NewIISCollector() (Collector, error) {
 		// W3SVC_W3WP
 		Threads: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_threads"),
-			"",
+			"Number of threads actively processing requests in the worker process",
 			[]string{"app", "pid", "state"},
 			nil,
 		),
 		MaximumThreads: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_max_threads"),
-			"",
+			"Maximum number of threads to which the thread pool can grow as needed",
 			[]string{"app", "pid"},
 			nil,
 		),
 		RequestsTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_requests_total"),
-			"",
+			"Total number of HTTP requests served by the worker process",
 			[]string{"app", "pid"},
 			nil,
 		),
 		RequestsActive: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_current_requests"),
-			"",
+			"Current number of requests being processed by the worker process",
 			[]string{"app", "pid"},
 			nil,
 		),
@@ -450,121 +555,121 @@ func NewIISCollector() (Collector, error) {
 		),
 		CurrentFileCacheMemoryUsage: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_file_cache_memory_bytes"),
-			"",
+			"Current number of bytes used by user-mode file cache",
 			[]string{"app", "pid"},
 			nil,
 		),
 		MaximumFileCacheMemoryUsage: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_file_cache_max_memory_bytes"),
-			"",
+			"Maximum number of bytes used by user-mode file cache",
 			[]string{"app", "pid"},
 			nil,
 		),
 		FileCacheFlushesTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_file_cache_flushes_total"),
-			"",
+			"Total number of files removed from the user-mode cache",
 			[]string{"app", "pid"},
 			nil,
 		),
 		FileCacheQueriesTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_file_cache_queries_total"),
-			"",
+			"Total file cache queries (hits + misses)",
 			[]string{"app", "pid"},
 			nil,
 		),
 		FileCacheHitsTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_file_cache_hits_total"),
-			"",
+			"Total number of successful lookups in the user-mode file cache",
 			[]string{"app", "pid"},
 			nil,
 		),
 		FilesCached: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_file_cache_items"),
-			"",
+			"Current number of files whose contents are present in user-mode cache",
 			[]string{"app", "pid"},
 			nil,
 		),
 		FilesCachedTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_file_cache_items_total"),
-			"",
+			"Total number of files whose contents were ever added to the user-mode cache (since service startup)",
 			[]string{"app", "pid"},
 			nil,
 		),
 		FilesFlushedTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_file_cache_items_flushed_total"),
-			"",
+			"Total number of file handles that have been removed from the user-mode cache (since service startup)",
 			[]string{"app", "pid"},
 			nil,
 		),
 		URICacheFlushesTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_uri_cache_flushes_total"),
-			"",
+			"Total number of URI cache flushes (since service startup)",
 			[]string{"app", "pid"},
 			nil,
 		),
 		URICacheQueriesTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_uri_cache_queries_total"),
-			"",
+			"Total number of uri cache queries (hits + misses)",
 			[]string{"app", "pid"},
 			nil,
 		),
 		URICacheHitsTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_uri_cache_hits_total"),
-			"",
+			"Total number of successful lookups in the user-mode URI cache (since service startup)",
 			[]string{"app", "pid"},
 			nil,
 		),
 		URIsCached: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_uri_cache_items"),
-			"",
+			"Number of URI information blocks currently in the user-mode cache",
 			[]string{"app", "pid"},
 			nil,
 		),
 		URIsCachedTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_uri_cache_items_total"),
-			"",
+			"Total number of URI information blocks added to the user-mode cache (since service startup)",
 			[]string{"app", "pid"},
 			nil,
 		),
 		URIsFlushedTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_uri_cache_items_flushed_total"),
-			"",
+			"The number of URI information blocks that have been removed from the user-mode cache (since service startup)",
 			[]string{"app", "pid"},
 			nil,
 		),
 		MetadataCached: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_metadata_cache_items"),
-			"",
+			"Number of metadata information blocks currently present in user-mode cache",
 			[]string{"app", "pid"},
 			nil,
 		),
 		MetadataCacheFlushes: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_metadata_cache_flushes_total"),
-			"",
+			"Total number of user-mode metadata cache flushes (since service startup)",
 			[]string{"app", "pid"},
 			nil,
 		),
 		MetadataCacheQueriesTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_metadata_cache_queries_total"),
-			"",
+			"Total metadata cache queries (hits + misses)",
 			[]string{"app", "pid"},
 			nil,
 		),
 		MetadataCacheHitsTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_metadata_cache_hits_total"),
-			"",
+			"Total number of successful lookups in the user-mode metadata cache (since service startup)",
 			[]string{"app", "pid"},
 			nil,
 		),
 		MetadataCachedTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_metadata_cache_items_cached_total"),
-			"",
+			"Total number of metadata information blocks added to the user-mode cache (since service startup)",
 			[]string{"app", "pid"},
 			nil,
 		),
 		MetadataFlushedTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_metadata_cache_items_flushed_total"),
-			"",
+			"Total number of metadata information blocks removed from the user-mode cache (since service startup)",
 			[]string{"app", "pid"},
 			nil,
 		),
@@ -576,44 +681,44 @@ func NewIISCollector() (Collector, error) {
 		),
 		OutputCacheItems: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_output_cache_items"),
-			"",
+			"Number of items current present in output cache",
 			[]string{"app", "pid"},
 			nil,
 		),
 		OutputCacheMemoryUsage: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_output_cache_memory_bytes"),
-			"",
+			"Current number of bytes used by output cache",
 			[]string{"app", "pid"},
 			nil,
 		),
 		OutputCacheQueriesTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_output_queries_total"),
-			"",
+			"Total number of output cache queries (hits + misses)",
 			[]string{"app", "pid"},
 			nil,
 		),
 		OutputCacheHitsTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_output_cache_hits_total"),
-			"",
+			"Total number of successful lookups in output cache (since service startup)",
 			[]string{"app", "pid"},
 			nil,
 		),
 		OutputCacheFlushedItemsTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_output_cache_items_flushed_total"),
-			"",
+			"Total number of items flushed from output cache (since service startup)",
 			[]string{"app", "pid"},
 			nil,
 		),
 		OutputCacheFlushesTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_output_cache_flushes_total"),
-			"",
+			"Total number of flushes of output cache (since service startup)",
 			[]string{"app", "pid"},
 			nil,
 		),
 		// W3SVC_W3WP_IIS8
 		RequestErrorsTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "worker_request_errors_total"),
-			"",
+			"Total number of requests that returned an error",
 			[]string{"app", "pid", "status_code"},
 			nil,
 		),
@@ -645,127 +750,127 @@ func NewIISCollector() (Collector, error) {
 		// Web Service Cache
 		ServiceCache_ActiveFlushedEntries: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "server_cache_active_flushed_entries"),
-			"Number of file handles cached in user-mode that will be closed when all current transfers complete.",
+			"Number of file handles cached that will be closed when all current transfers complete.",
 			nil,
 			nil,
 		),
 		ServiceCache_CurrentFileCacheMemoryUsage: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "server_file_cache_memory_bytes"),
-			"",
+			"Current number of bytes used by file cache",
 			nil,
 			nil,
 		),
 		ServiceCache_MaximumFileCacheMemoryUsage: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "server_file_cache_max_memory_bytes"),
-			"",
+			"Maximum number of bytes used by file cache",
 			nil,
 			nil,
 		),
 		ServiceCache_FileCacheFlushesTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "server_file_cache_flushes_total"),
-			"",
+			"Total number of file cache flushes (since service startup)",
 			nil,
 			nil,
 		),
 		ServiceCache_FileCacheQueriesTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "server_file_cache_queries_total"),
-			"",
+			"Total number of file cache queries (hits + misses)",
 			nil,
 			nil,
 		),
 		ServiceCache_FileCacheHitsTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "server_file_cache_hits_total"),
-			"",
+			"Total number of successful lookups in the user-mode file cache",
 			nil,
 			nil,
 		),
 		ServiceCache_FilesCached: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "server_file_cache_items"),
-			"",
+			"Current number of files whose contents are present in cache",
 			nil,
 			nil,
 		),
 		ServiceCache_FilesCachedTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "server_file_cache_items_total"),
-			"",
+			"Total number of files whose contents were ever added to the cache (since service startup)",
 			nil,
 			nil,
 		),
 		ServiceCache_FilesFlushedTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "server_file_cache_items_flushed_total"),
-			"",
+			"Total number of file handles that have been removed from the cache (since service startup)",
 			nil,
 			nil,
 		),
 		ServiceCache_URICacheFlushesTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "server_uri_cache_flushes_total"),
-			"",
+			"Total number of URI cache flushes (since service startup)",
 			[]string{"mode"},
 			nil,
 		),
 		ServiceCache_URICacheQueriesTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "server_uri_cache_queries_total"),
-			"",
+			"Total number of uri cache queries (hits + misses)",
 			[]string{"mode"},
 			nil,
 		),
 		ServiceCache_URICacheHitsTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "server_uri_cache_hits_total"),
-			"",
+			"Total number of successful lookups in the URI cache (since service startup)",
 			[]string{"mode"},
 			nil,
 		),
 		ServiceCache_URIsCached: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "server_uri_cache_items"),
-			"",
+			"Number of URI information blocks currently in the cache",
 			[]string{"mode"},
 			nil,
 		),
 		ServiceCache_URIsCachedTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "server_uri_cache_items_total"),
-			"",
+			"Total number of URI information blocks added to the cache (since service startup)",
 			[]string{"mode"},
 			nil,
 		),
 		ServiceCache_URIsFlushedTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "server_uri_cache_items_flushed_total"),
-			"",
+			"The number of URI information blocks that have been removed from the cache (since service startup)",
 			[]string{"mode"},
 			nil,
 		),
 		ServiceCache_MetadataCached: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "server_metadata_cache_items"),
-			"",
+			"Number of metadata information blocks currently present in cache",
 			nil,
 			nil,
 		),
 		ServiceCache_MetadataCacheFlushes: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "server_metadata_cache_flushes_total"),
-			"",
+			"Total number of metadata cache flushes (since service startup)",
 			nil,
 			nil,
 		),
 		ServiceCache_MetadataCacheQueriesTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "server_metadata_cache_queries_total"),
-			"",
+			"Total metadata cache queries (hits + misses)",
 			nil,
 			nil,
 		),
 		ServiceCache_MetadataCacheHitsTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "server_metadata_cache_hits_total"),
-			"",
+			"Total number of successful lookups in the metadata cache (since service startup)",
 			nil,
 			nil,
 		),
 		ServiceCache_MetadataCachedTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "server_metadata_cache_items_cached_total"),
-			"",
+			"Total number of metadata information blocks added to the cache (since service startup)",
 			nil,
 			nil,
 		),
 		ServiceCache_MetadataFlushedTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "server_metadata_cache_items_flushed_total"),
-			"",
+			"Total number of metadata information blocks removed from the cache (since service startup)",
 			nil,
 			nil,
 		),
@@ -777,37 +882,37 @@ func NewIISCollector() (Collector, error) {
 		),
 		ServiceCache_OutputCacheItems: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "server_output_cache_items"),
-			"",
+			"Number of items current present in output cache",
 			nil,
 			nil,
 		),
 		ServiceCache_OutputCacheMemoryUsage: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "server_output_cache_memory_bytes"),
-			"",
+			"Current number of bytes used by output cache",
 			nil,
 			nil,
 		),
 		ServiceCache_OutputCacheQueriesTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "server_output_cache_queries_total"),
-			"",
+			"Total output cache queries (hits + misses)",
 			nil,
 			nil,
 		),
 		ServiceCache_OutputCacheHitsTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "server_output_cache_hits_total"),
-			"",
+			"Total number of successful lookups in output cache (since service startup)",
 			nil,
 			nil,
 		),
 		ServiceCache_OutputCacheFlushedItemsTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "server_output_cache_items_flushed_total"),
-			"",
+			"Total number of items flushed from output cache (since service startup)",
 			nil,
 			nil,
 		),
 		ServiceCache_OutputCacheFlushesTotal: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "server_output_cache_flushes_total"),
-			"",
+			"Total number of flushes of output cache (since service startup)",
 			nil,
 			nil,
 		),
@@ -818,7 +923,7 @@ func NewIISCollector() (Collector, error) {
 			nil,
 		),
 		RequestQueues_RejectedRequest: prometheus.NewDesc(
-			prometheus.BuildFQName(Namespace, subsystem, "http_requests_rejected"),
+			prometheus.BuildFQName(Namespace, subsystem, "http_requests_rejected_total"),
 			"",
 			[]string{"app"},
 			nil,
@@ -830,17 +935,17 @@ func NewIISCollector() (Collector, error) {
 // to the provided prometheus Metric channel.
 func (c *IISCollector) Collect(ctx *ScrapeContext, ch chan<- prometheus.Metric) error {
 	if desc, err := c.collectWebService(ctx, ch); err != nil {
-		log.Error("failed collecting iis metrics:", desc, err)
+		_ = level.Error(c.logger).Log("msg", "failed collecting iis metrics", "desc", desc, "err", err)
 		return err
 	}
 
 	if desc, err := c.collectAPP_POOL_WAS(ctx, ch); err != nil {
-		log.Error("failed collecting iis metrics:", desc, err)
+		_ = level.Error(c.logger).Log("msg", "failed collecting iis metrics", "desc", desc, "err", err)
 		return err
 	}
 
 	if desc, err := c.collectW3SVC_W3WP(ctx, ch); err != nil {
-		log.Error("failed collecting iis metrics:", desc, err)
+		_ = level.Error(c.logger).Log("msg", "failed collecting iis metrics", "desc", desc, "err", err)
 		return err
 	}
 
@@ -866,6 +971,7 @@ type perflibWebService struct {
 	CurrentConnections            float64 `perflib:"Current Connections"`
 	CurrentISAPIExtensionRequests float64 `perflib:"Current ISAPI Extension Requests"`
 	CurrentNonAnonymousUsers      float64 `perflib:"Current NonAnonymous Users"`
+	ServiceUptime                 float64 `perflib:"Service Uptime"`
 
 	TotalBytesReceived                  float64 `perflib:"Total Bytes Received"`
 	TotalBytesSent                      float64 `perflib:"Total Bytes Sent"`
@@ -899,14 +1005,62 @@ type perflibWebService struct {
 	TotalUnlockRequests                 float64 `perflib:"Total Unlock Requests"`
 }
 
+// Fulfill the hasGetIISName interface
+func (p perflibWebService) getIISName() string {
+	return p.Name
+}
+
+// Fulfill the hasGetIISName interface
+func (p perflibAPP_POOL_WAS) getIISName() string {
+	return p.Name
+}
+
+// Fulfill the hasGetIISName interface
+func (p perflibW3SVC_W3WP) getIISName() string {
+	return p.Name
+}
+
+// Fulfill the hasGetIISName interface
+func (p perflibW3SVC_W3WP_IIS8) getIISName() string {
+	return p.Name
+}
+
+// Required as Golang doesn't allow access to struct fields in generic functions. That restriction may be removed in a future release.
+type hasGetIISName interface {
+	getIISName() string
+}
+
+// Deduplicate IIS site names from various IIS perflib objects.
+//
+// E.G. Given the following list of site names, "Site_B" would be
+// discarded, and "Site_B#2" would be kept and presented as "Site_B" in the
+// collector metrics.
+// [ "Site_A", "Site_B", "Site_C", "Site_B#2" ]
+func dedupIISNames[V hasGetIISName](services []V) map[string]V {
+	// Ensure IIS entry with the highest suffix occurs last
+	sort.SliceStable(services, func(i, j int) bool {
+		return services[i].getIISName() < services[j].getIISName()
+	})
+
+	var webServiceDeDuplicated = make(map[string]V)
+
+	// Use map to deduplicate IIS entries
+	for _, entry := range services {
+		name := strings.Split(entry.getIISName(), "#")[0]
+		webServiceDeDuplicated[name] = entry
+	}
+	return webServiceDeDuplicated
+}
 func (c *IISCollector) collectWebService(ctx *ScrapeContext, ch chan<- prometheus.Metric) (*prometheus.Desc, error) {
-	var WebService []perflibWebService
-	if err := unmarshalObject(ctx.perfObjects["Web Service"], &WebService); err != nil {
+	var webService []perflibWebService
+	if err := unmarshalObject(ctx.perfObjects["Web Service"], &webService, c.logger); err != nil {
 		return nil, err
 	}
 
-	for _, app := range WebService {
-		if app.Name == "_Total" || c.siteBlacklistPattern.MatchString(app.Name) || !c.siteWhitelistPattern.MatchString(app.Name) {
+	webServiceDeDuplicated := dedupIISNames(webService)
+
+	for name, app := range webServiceDeDuplicated {
+		if name == "_Total" || c.siteExcludePattern.MatchString(name) || !c.siteIncludePattern.MatchString(name) {
 			continue
 		}
 
@@ -914,232 +1068,238 @@ func (c *IISCollector) collectWebService(ctx *ScrapeContext, ch chan<- prometheu
 			c.CurrentAnonymousUsers,
 			prometheus.GaugeValue,
 			app.CurrentAnonymousUsers,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.CurrentBlockedAsyncIORequests,
 			prometheus.GaugeValue,
 			app.CurrentBlockedAsyncIORequests,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.CurrentCGIRequests,
 			prometheus.GaugeValue,
 			app.CurrentCGIRequests,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.CurrentConnections,
 			prometheus.GaugeValue,
 			app.CurrentConnections,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.CurrentISAPIExtensionRequests,
 			prometheus.GaugeValue,
 			app.CurrentISAPIExtensionRequests,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.CurrentNonAnonymousUsers,
 			prometheus.GaugeValue,
 			app.CurrentNonAnonymousUsers,
-			app.Name,
+			name,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			c.ServiceUptime,
+			prometheus.GaugeValue,
+			app.ServiceUptime,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalBytesReceived,
 			prometheus.CounterValue,
 			app.TotalBytesReceived,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalBytesSent,
 			prometheus.CounterValue,
 			app.TotalBytesSent,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalAnonymousUsers,
 			prometheus.CounterValue,
 			app.TotalAnonymousUsers,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalBlockedAsyncIORequests,
 			prometheus.CounterValue,
 			app.TotalBlockedAsyncIORequests,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalCGIRequests,
 			prometheus.CounterValue,
 			app.TotalCGIRequests,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalConnectionAttemptsAllInstances,
 			prometheus.CounterValue,
 			app.TotalConnectionAttemptsAllInstances,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalFilesReceived,
 			prometheus.CounterValue,
 			app.TotalFilesReceived,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalFilesSent,
 			prometheus.CounterValue,
 			app.TotalFilesSent,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalISAPIExtensionRequests,
 			prometheus.CounterValue,
 			app.TotalISAPIExtensionRequests,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalLockedErrors,
 			prometheus.CounterValue,
 			app.TotalLockedErrors,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalLogonAttempts,
 			prometheus.CounterValue,
 			app.TotalLogonAttempts,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalNonAnonymousUsers,
 			prometheus.CounterValue,
 			app.TotalNonAnonymousUsers,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalNotFoundErrors,
 			prometheus.CounterValue,
 			app.TotalNotFoundErrors,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalRejectedAsyncIORequests,
 			prometheus.CounterValue,
 			app.TotalRejectedAsyncIORequests,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalRequests,
 			prometheus.CounterValue,
 			app.TotalOtherRequests,
-			app.Name,
+			name,
 			"other",
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalRequests,
 			prometheus.CounterValue,
 			app.TotalCopyRequests,
-			app.Name,
+			name,
 			"COPY",
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalRequests,
 			prometheus.CounterValue,
 			app.TotalDeleteRequests,
-			app.Name,
+			name,
 			"DELETE",
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalRequests,
 			prometheus.CounterValue,
 			app.TotalGetRequests,
-			app.Name,
+			name,
 			"GET",
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalRequests,
 			prometheus.CounterValue,
 			app.TotalHeadRequests,
-			app.Name,
+			name,
 			"HEAD",
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalRequests,
 			prometheus.CounterValue,
 			app.TotalLockRequests,
-			app.Name,
+			name,
 			"LOCK",
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalRequests,
 			prometheus.CounterValue,
 			app.TotalMkcolRequests,
-			app.Name,
+			name,
 			"MKCOL",
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalRequests,
 			prometheus.CounterValue,
 			app.TotalMoveRequests,
-			app.Name,
+			name,
 			"MOVE",
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalRequests,
 			prometheus.CounterValue,
 			app.TotalOptionsRequests,
-			app.Name,
+			name,
 			"OPTIONS",
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalRequests,
 			prometheus.CounterValue,
 			app.TotalPostRequests,
-			app.Name,
+			name,
 			"POST",
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalRequests,
 			prometheus.CounterValue,
 			app.TotalPropfindRequests,
-			app.Name,
+			name,
 			"PROPFIND",
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalRequests,
 			prometheus.CounterValue,
 			app.TotalProppatchRequests,
-			app.Name,
+			name,
 			"PROPPATCH",
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalRequests,
 			prometheus.CounterValue,
 			app.TotalPutRequests,
-			app.Name,
+			name,
 			"PUT",
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalRequests,
 			prometheus.CounterValue,
 			app.TotalSearchRequests,
-			app.Name,
+			name,
 			"SEARCH",
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalRequests,
 			prometheus.CounterValue,
 			app.TotalTraceRequests,
-			app.Name,
+			name,
 			"TRACE",
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalRequests,
 			prometheus.CounterValue,
 			app.TotalUnlockRequests,
-			app.Name,
+			name,
 			"UNLOCK",
 		)
 	}
@@ -1179,14 +1339,16 @@ var applicationStates = map[uint32]string{
 
 func (c *IISCollector) collectAPP_POOL_WAS(ctx *ScrapeContext, ch chan<- prometheus.Metric) (*prometheus.Desc, error) {
 	var APP_POOL_WAS []perflibAPP_POOL_WAS
-	if err := unmarshalObject(ctx.perfObjects["APP_POOL_WAS"], &APP_POOL_WAS); err != nil {
+	if err := unmarshalObject(ctx.perfObjects["APP_POOL_WAS"], &APP_POOL_WAS, c.logger); err != nil {
 		return nil, err
 	}
 
-	for _, app := range APP_POOL_WAS {
-		if app.Name == "_Total" ||
-			c.appBlacklistPattern.MatchString(app.Name) ||
-			!c.appWhitelistPattern.MatchString(app.Name) {
+	appPoolDeDuplicated := dedupIISNames(APP_POOL_WAS)
+
+	for name, app := range appPoolDeDuplicated {
+		if name == "_Total" ||
+			c.appExcludePattern.MatchString(name) ||
+			!c.appIncludePattern.MatchString(name) {
 			continue
 		}
 
@@ -1199,7 +1361,7 @@ func (c *IISCollector) collectAPP_POOL_WAS(ctx *ScrapeContext, ch chan<- prometh
 				c.CurrentApplicationPoolState,
 				prometheus.GaugeValue,
 				isCurrentState,
-				app.Name,
+				name,
 				label,
 			)
 		}
@@ -1208,73 +1370,73 @@ func (c *IISCollector) collectAPP_POOL_WAS(ctx *ScrapeContext, ch chan<- prometh
 			c.CurrentApplicationPoolUptime,
 			prometheus.GaugeValue,
 			app.CurrentApplicationPoolUptime,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.CurrentWorkerProcesses,
 			prometheus.GaugeValue,
 			app.CurrentWorkerProcesses,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.MaximumWorkerProcesses,
 			prometheus.GaugeValue,
 			app.MaximumWorkerProcesses,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.RecentWorkerProcessFailures,
 			prometheus.GaugeValue,
 			app.RecentWorkerProcessFailures,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TimeSinceLastWorkerProcessFailure,
 			prometheus.GaugeValue,
 			app.TimeSinceLastWorkerProcessFailure,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalApplicationPoolRecycles,
 			prometheus.CounterValue,
 			app.TotalApplicationPoolRecycles,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalApplicationPoolUptime,
 			prometheus.CounterValue,
 			app.TotalApplicationPoolUptime,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalWorkerProcessesCreated,
 			prometheus.CounterValue,
 			app.TotalWorkerProcessesCreated,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalWorkerProcessFailures,
 			prometheus.CounterValue,
 			app.TotalWorkerProcessFailures,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalWorkerProcessPingFailures,
 			prometheus.CounterValue,
 			app.TotalWorkerProcessPingFailures,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalWorkerProcessShutdownFailures,
 			prometheus.CounterValue,
 			app.TotalWorkerProcessShutdownFailures,
-			app.Name,
+			name,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			c.TotalWorkerProcessStartupFailures,
 			prometheus.CounterValue,
 			app.TotalWorkerProcessStartupFailures,
-			app.Name,
+			name,
 		)
 	}
 
@@ -1341,6 +1503,7 @@ type perflibW3SVC_W3WP_IIS8 struct {
 
 	RequestErrorsTotal float64
 	RequestErrors500   float64 `perflib:"% 500 HTTP Response Sent"`
+	RequestErrors503   float64 `perflib:"% 503 HTTP Response Sent"`
 	RequestErrors404   float64 `perflib:"% 404 HTTP Response Sent"`
 	RequestErrors403   float64 `perflib:"% 403 HTTP Response Sent"`
 	RequestErrors401   float64 `perflib:"% 401 HTTP Response Sent"`
@@ -1353,21 +1516,23 @@ type perflibW3SVC_W3WP_IIS8 struct {
 
 func (c *IISCollector) collectW3SVC_W3WP(ctx *ScrapeContext, ch chan<- prometheus.Metric) (*prometheus.Desc, error) {
 	var W3SVC_W3WP []perflibW3SVC_W3WP
-	if err := unmarshalObject(ctx.perfObjects["W3SVC_W3WP"], &W3SVC_W3WP); err != nil {
+	if err := unmarshalObject(ctx.perfObjects["W3SVC_W3WP"], &W3SVC_W3WP, c.logger); err != nil {
 		return nil, err
 	}
 
-	for _, app := range W3SVC_W3WP {
+	w3svcW3WPDeduplicated := dedupIISNames(W3SVC_W3WP)
+
+	for w3Name, app := range w3svcW3WPDeduplicated {
 		// Extract the apppool name from the format <PID>_<NAME>
-		pid := workerProcessNameExtractor.ReplaceAllString(app.Name, "$1")
-		name := workerProcessNameExtractor.ReplaceAllString(app.Name, "$2")
-		if name == "" {
-			log.Error("no instances found in W3SVC_W3WP - skipping collection")
-			break
+		pid := workerProcessNameExtractor.ReplaceAllString(w3Name, "$1")
+		name := workerProcessNameExtractor.ReplaceAllString(w3Name, "$2")
+		if name == "" || name == "_Total" ||
+			c.appExcludePattern.MatchString(name) ||
+			!c.appIncludePattern.MatchString(name) {
+			continue
 		}
-		if name == "_Total" ||
-			c.appBlacklistPattern.MatchString(name) ||
-			!c.appWhitelistPattern.MatchString(name) {
+		// Duplicate instances are suffixed # with an index number. These should be ignored
+		if strings.Contains(app.Name, "#") {
 			continue
 		}
 
@@ -1609,21 +1774,19 @@ func (c *IISCollector) collectW3SVC_W3WP(ctx *ScrapeContext, ch chan<- prometheu
 
 	if c.iis_version.major >= 8 {
 		var W3SVC_W3WP_IIS8 []perflibW3SVC_W3WP_IIS8
-		if err := unmarshalObject(ctx.perfObjects["W3SVC_W3WP"], &W3SVC_W3WP_IIS8); err != nil {
+		if err := unmarshalObject(ctx.perfObjects["W3SVC_W3WP"], &W3SVC_W3WP_IIS8, c.logger); err != nil {
 			return nil, err
 		}
 
-		for _, app := range W3SVC_W3WP_IIS8 {
+		w3svcW3WPIIS8Deduplicated := dedupIISNames(W3SVC_W3WP_IIS8)
+
+		for w3Name, app := range w3svcW3WPIIS8Deduplicated {
 			// Extract the apppool name from the format <PID>_<NAME>
-			pid := workerProcessNameExtractor.ReplaceAllString(app.Name, "$1")
-			name := workerProcessNameExtractor.ReplaceAllString(app.Name, "$2")
-			if name == "" {
-				log.Error("no instances found in W3SVC_W3WP_IIS8 - skipping collection")
-				break
-			}
-			if name == "_Total" ||
-				c.appBlacklistPattern.MatchString(name) ||
-				!c.appWhitelistPattern.MatchString(name) {
+			pid := workerProcessNameExtractor.ReplaceAllString(w3Name, "$1")
+			name := workerProcessNameExtractor.ReplaceAllString(w3Name, "$2")
+			if name == "" || name == "_Total" ||
+				c.appExcludePattern.MatchString(name) ||
+				!c.appIncludePattern.MatchString(name) {
 				continue
 			}
 
@@ -1658,6 +1821,14 @@ func (c *IISCollector) collectW3SVC_W3WP(ctx *ScrapeContext, ch chan<- prometheu
 				name,
 				pid,
 				"500",
+			)
+			ch <- prometheus.MustNewConstMetric(
+				c.RequestErrorsTotal,
+				prometheus.CounterValue,
+				app.RequestErrors503,
+				name,
+				pid,
+				"503",
 			)
 			ch <- prometheus.MustNewConstMetric(
 				c.WebSocketRequestsActive,
@@ -1742,7 +1913,7 @@ type perflibWebServiceCache struct {
 
 func (c *IISCollector) collectWebServiceCache(ctx *ScrapeContext, ch chan<- prometheus.Metric) (*prometheus.Desc, error) {
 	var WebServiceCache []perflibWebServiceCache
-	if err := unmarshalObject(ctx.perfObjects["Web Service Cache"], &WebServiceCache); err != nil {
+	if err := unmarshalObject(ctx.perfObjects["Web Service Cache"], &WebServiceCache, c.logger); err != nil {
 		return nil, err
 	}
 
@@ -1959,7 +2130,7 @@ func (c *IISCollector) collectHTTPServiceRequestQueuesP(ctx *ScrapeContext, ch c
 
 		ch <- prometheus.MustNewConstMetric(
 			c.RequestQueues_RejectedRequest,
-			prometheus.GaugeValue,
+			prometheus.CounterValue,
 			app.RejectedRequests,
 			app.Name,
 		)

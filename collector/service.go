@@ -6,32 +6,31 @@ package collector
 import (
 	"fmt"
 	"strings"
+	"syscall"
 
-	"github.com/StackExchange/wmi"
-	"github.com/prometheus-community/windows_exporter/log"
+	"github.com/alecthomas/kingpin/v2"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/yusufpapurcu/wmi"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc/mgr"
-	"gopkg.in/alecthomas/kingpin.v2"
 )
 
-func init() {
-	registerCollector("service", NewserviceCollector)
-}
+const (
+	FlagServiceWhereClause = "collector.service.services-where"
+	FlagServiceUseAPI      = "collector.service.use-api"
+)
 
 var (
-	serviceWhereClause = kingpin.Flag(
-		"collector.service.services-where",
-		"WQL 'where' clause to use in WMI metrics query. Limits the response to the services you specify and reduces the size of the response.",
-	).Default("").String()
-	useAPI = kingpin.Flag(
-		"collector.service.use-api",
-		"Use API calls to collect service data instead of WMI. Flag 'collector.service.services-where' won't be effective.",
-	).Default("false").Bool()
+	serviceWhereClause *string
+	useAPI             *bool
 )
 
 // A serviceCollector is a Prometheus collector for WMI Win32_Service metrics
 type serviceCollector struct {
+	logger log.Logger
+
 	Information *prometheus.Desc
 	State       *prometheus.Desc
 	StartMode   *prometheus.Desc
@@ -40,18 +39,33 @@ type serviceCollector struct {
 	queryWhereClause string
 }
 
-// NewserviceCollector ...
-func NewserviceCollector() (Collector, error) {
+// newServiceCollectorFlags ...
+func newServiceCollectorFlags(app *kingpin.Application) {
+	serviceWhereClause = app.Flag(
+		FlagServiceWhereClause,
+		"WQL 'where' clause to use in WMI metrics query. Limits the response to the services you specify and reduces the size of the response.",
+	).Default("").String()
+	useAPI = app.Flag(
+		FlagServiceUseAPI,
+		"Use API calls to collect service data instead of WMI. Flag 'collector.service.services-where' won't be effective.",
+	).Default("false").Bool()
+}
+
+// newserviceCollector ...
+func newserviceCollector(logger log.Logger) (Collector, error) {
 	const subsystem = "service"
+	logger = log.With(logger, "collector", subsystem)
 
 	if *serviceWhereClause == "" {
-		log.Warn("No where-clause specified for service collector. This will generate a very large number of metrics!")
+		_ = level.Warn(logger).Log("msg", "No where-clause specified for service collector. This will generate a very large number of metrics!")
 	}
 	if *useAPI {
-		log.Warn("API collection is enabled.")
+		_ = level.Warn(logger).Log("msg", "API collection is enabled.")
 	}
 
 	return &serviceCollector{
+		logger: logger,
+
 		Information: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "info"),
 			"A metric with a constant '1' value labeled with service information",
@@ -85,12 +99,12 @@ func NewserviceCollector() (Collector, error) {
 func (c *serviceCollector) Collect(ctx *ScrapeContext, ch chan<- prometheus.Metric) error {
 	if *useAPI {
 		if err := c.collectAPI(ch); err != nil {
-			log.Error("failed collecting API service metrics:", err)
+			_ = level.Error(c.logger).Log("msg", "failed collecting API service metrics:", "err", err)
 			return err
 		}
 	} else {
 		if err := c.collectWMI(ch); err != nil {
-			log.Error("failed collecting WMI service metrics:", err)
+			_ = level.Error(c.logger).Log("msg", "failed collecting WMI service metrics:", "err", err)
 			return err
 		}
 	}
@@ -161,7 +175,7 @@ var (
 
 func (c *serviceCollector) collectWMI(ch chan<- prometheus.Metric) error {
 	var dst []Win32_Service
-	q := queryAllWhere(&dst, c.queryWhereClause)
+	q := queryAllWhere(&dst, c.queryWhereClause, c.logger)
 	if err := wmi.Query(q, &dst); err != nil {
 		return err
 	}
@@ -234,30 +248,43 @@ func (c *serviceCollector) collectAPI(ch chan<- prometheus.Metric) error {
 	}
 	defer svcmgrConnection.Disconnect() //nolint:errcheck
 
-	// List All Services from the Services Manager
+	// List All Services from the Services Manager.
 	serviceList, err := svcmgrConnection.ListServices()
 	if err != nil {
 		return err
 	}
 
-	// Iterate through the Services List
+	// Iterate through the Services List.
 	for _, service := range serviceList {
-		// Retrieve handle for each service
-		serviceHandle, err := svcmgrConnection.OpenService(service)
+		// Get UTF16 service name.
+		serviceName, err := syscall.UTF16PtrFromString(service)
 		if err != nil {
-			continue
-		}
-		defer serviceHandle.Close()
-
-		// Get Service Configuration
-		serviceConfig, err := serviceHandle.Config()
-		if err != nil {
+			_ = level.Warn(c.logger).Log("msg", fmt.Sprintf("Service %s get name error:  %#v", service, err))
 			continue
 		}
 
-		// Get Service Current Status
-		serviceStatus, err := serviceHandle.Query()
+		// Open connection for service handler.
+		serviceHandle, err := windows.OpenService(svcmgrConnection.Handle, serviceName, windows.GENERIC_READ)
 		if err != nil {
+			_ = level.Warn(c.logger).Log("msg", fmt.Sprintf("Open service %s error:  %#v", service, err))
+			continue
+		}
+
+		// Create handle for each service.
+		serviceManager := &mgr.Service{Name: service, Handle: serviceHandle}
+		defer serviceManager.Close()
+
+		// Get Service Configuration.
+		serviceConfig, err := serviceManager.Config()
+		if err != nil {
+			_ = level.Warn(c.logger).Log("msg", fmt.Sprintf("Get ervice %s config error:  %#v", service, err))
+			continue
+		}
+
+		// Get Service Current Status.
+		serviceStatus, err := serviceManager.Query()
+		if err != nil {
+			_ = level.Warn(c.logger).Log("msg", fmt.Sprintf("Get service %s status error:  %#v", service, err))
 			continue
 		}
 

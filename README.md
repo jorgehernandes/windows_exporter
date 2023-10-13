@@ -27,6 +27,11 @@ Name     | Description | Enabled by default
 [logical_disk](docs/collector.logical_disk.md) | Logical disks, disk I/O | &#10003;
 [logon](docs/collector.logon.md) | User logon sessions |
 [memory](docs/collector.memory.md) | Memory usage metrics |
+[mscluster_cluster](docs/collector.mscluster_cluster.md) | MSCluster cluster metrics |
+[mscluster_network](docs/collector.mscluster_network.md) | MSCluster network metrics |
+[mscluster_node](docs/collector.mscluster_node.md) | MSCluster Node metrics |
+[mscluster_resource](docs/collector.mscluster_resource.md) | MSCluster Resource metrics |
+[mscluster_resourcegroup](docs/collector.mscluster_resourcegroup.md) | MSCluster ResourceGroup metrics |
 [msmq](docs/collector.msmq.md) | MSMQ queues |
 [mssql](docs/collector.mssql.md) | [SQL Server Performance Objects](https://docs.microsoft.com/en-us/sql/relational-databases/performance-monitor/use-sql-server-objects#SQLServerPOs) metrics  |
 [netframework_clrexceptions](docs/collector.netframework_clrexceptions.md) | .NET Framework CLR Exceptions |
@@ -41,14 +46,17 @@ Name     | Description | Enabled by default
 [os](docs/collector.os.md) | OS metrics (memory, processes, users) | &#10003;
 [process](docs/collector.process.md) | Per-process metrics |
 [remote_fx](docs/collector.remote_fx.md) | RemoteFX protocol (RDP) metrics |
+[scheduled_task](docs/collector.scheduled_task.md) | Scheduled Tasks metrics |
 [service](docs/collector.service.md) | Service state metrics | &#10003;
 [smtp](docs/collector.smtp.md) | IIS SMTP Server |
 [system](docs/collector.system.md) | System calls | &#10003;
 [tcp](docs/collector.tcp.md) | TCP connections |
+[teradici_pcoip](docs/collector.teradici_pcoip.md) | [Teradici PCoIP](https://www.teradici.com/web-help/pcoip_wmi_specs/) session metrics |
 [time](docs/collector.time.md) | Windows Time Service |
 [thermalzone](docs/collector.thermalzone.md) | Thermal information
 [terminal_services](docs/collector.terminal_services.md) | Terminal services (RDS)
 [textfile](docs/collector.textfile.md) | Read prometheus metrics from a text file | &#10003;
+[vmware_blast](docs/collector.vmware_blast.md) | VMware Blast session metrics |
 [vmware](docs/collector.vmware.md) | Performance counters installed by the Vmware Guest agent |
 
 See the linked documentation on each collector for more information on reported metrics, configuration settings and usage examples.
@@ -74,13 +82,15 @@ windows_exporter accepts flags to configure certain behaviours. The ones configu
 
 Flag     | Description | Default value
 ---------|-------------|--------------------
-`--telemetry.addr` | host:port for exporter. | `:9182`
+`--web.listen-address` | host:port for exporter. | `:9182`
 `--telemetry.path` | URL path for surfacing collected metrics. | `/metrics`
 `--telemetry.max-requests` | Maximum number of concurrent requests. 0 to disable. | `5`
 `--collectors.enabled` | Comma-separated list of collectors to use. Use `[defaults]` as a placeholder which gets expanded containing all the collectors enabled by default." | `[defaults]`
-`--collectors.print` | If true, print available collectors and exit. | 
+`--collectors.print` | If true, print available collectors and exit. |
 `--scrape.timeout-margin` | Seconds to subtract from the timeout allowed by the client. Tune to allow for overhead or high loads. | `0.5`
 `--web.config.file` | A [web config][web_config] for setting up TLS and Auth | None
+`--config.file` | [Using a config file](#using-a-configuration-file) from path or URL | None
+`--config.file.insecure-skip-verify` | Skip TLS when loading config file from URL | false
 
 ## Installation
 The latest release can be downloaded from the [releases page](https://github.com/prometheus-community/windows_exporter/releases).
@@ -96,7 +106,7 @@ Name | Description
 `LISTEN_PORT` | The port to bind to. Defaults to 9182.
 `METRICS_PATH` | The path at which to serve metrics. Defaults to `/metrics`
 `TEXTFILE_DIR` | As the `--collector.textfile.directory` flag, provide a directory to read text files with metrics from
-`REMOTE_ADDR` | Allows setting comma separated remote IP addresses for the Windows Firewall exception (whitelist). Defaults to an empty string (any remote address).
+`REMOTE_ADDR` | Allows setting comma separated remote IP addresses for the Windows Firewall exception (allow list). Defaults to an empty string (any remote address).
 `EXTRA_FLAGS` | Allows passing full CLI flags. Defaults to an empty string.
 
 Parameters are sent to the installer via `msiexec`. Example invocations:
@@ -113,6 +123,13 @@ msiexec /i <path-to-msi-file> ENABLED_COLLECTORS=os,service --% EXTRA_FLAGS="--c
 On some older versions of Windows you may need to surround parameter values with double quotes to get the install command parsing properly:
 ```powershell
 msiexec /i C:\Users\Administrator\Downloads\windows_exporter.msi ENABLED_COLLECTORS="ad,iis,logon,memory,process,tcp,thermalzone" TEXTFILE_DIR="C:\custom_metrics\"
+```
+
+Powershell versions 7.3 and above require [PSNativeCommandArgumentPassing](https://learn.microsoft.com/en-us/powershell/scripting/learn/experimental-features?view=powershell-7.3) to be set to `Legacy` when using `--% EXTRA_FLAGS`:
+
+```powershell
+$PSNativeCommandArgumentPassing = 'Legacy'
+msiexec /i <path-to-msi-file> ENABLED_COLLECTORS=os,service --% EXTRA_FLAGS="--collector.service.services-where ""Name LIKE 'sql%'"""
 ```
 
 
@@ -142,7 +159,7 @@ The prometheus metrics will be exposed on [localhost:9182](http://localhost:9182
 
 ### Enable only process collector and specify a custom query
 
-    .\windows_exporter.exe --collectors.enabled "process" --collector.process.whitelist="firefox.+"
+    .\windows_exporter.exe --collectors.enabled "process" --collector.process.include="firefox.+"
 
 When there are multiple processes with the same name, WMI represents those after the first instance as `process-name#index`. So to get them all, rather than just the first one, the [regular expression](https://en.wikipedia.org/wiki/Regular_expression) must use `.+`. See [process](docs/collector.process.md) for more information.
 
@@ -151,12 +168,16 @@ When there are multiple processes with the same name, WMI represents those after
 Using `[defaults]`  with `--collectors.enabled` argument which gets expanded with all default collectors.
 
     .\windows_exporter.exe --collectors.enabled "[defaults],process,container"
-    
+
 This enables the additional process and container collectors on top of the defaults.
 
 ### Using a configuration file
 
-YAML configuration files can be specified with the `--config.file` flag. E.G. `.\windows_exporter.exe --config.file=config.yml`
+YAML configuration files can be specified with the `--config.file` flag. e.g. `.\windows_exporter.exe --config.file=config.yml`. If you are using the absolute path, make sure to quote the path, e.g. `.\windows_exporter.exe --config.file="C:\Program Files\windows_exporter\config.yml"`
+
+It is also possible to load the configuration from a URL. e.g. `.\windows_exporter.exe --config.file="https://example.com/config.yml"`
+
+If you need to skip TLS verification, you can use the `--config.file.insecure-skip-verify` flag. e.g. `.\windows_exporter.exe --config.file="https://example.com/config.yml" --config.file.insecure-skip-verify`
 
 ```yaml
 collectors:
