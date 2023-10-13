@@ -950,12 +950,12 @@ func (c *IISCollector) Collect(ctx *ScrapeContext, ch chan<- prometheus.Metric) 
 	}
 
 	if desc, err := c.collectWebServiceCache(ctx, ch); err != nil {
-		log.Error("failed collecting iis metrics:", desc, err)
+		_ = level.Error(c.logger).Log("msg", "failed collecting iis metrics", "desc", desc, "err", err)
 		return err
 	}
 
 	if desc, err := c.collectHTTPServiceRequestQueuesP(ctx, ch); err != nil {
-		log.Error("failed collecting iis metrics:", desc, err)
+		_ = level.Error(c.logger).Log("msg", "failed collecting iis metrics", "desc", desc, "err", err)
 		return err
 	}
 
@@ -2115,7 +2115,7 @@ type perflibHTTPServiceRequestQueues struct {
 func (c *IISCollector) collectHTTPServiceRequestQueuesP(ctx *ScrapeContext, ch chan<- prometheus.Metric) (*prometheus.Desc, error) {
 	var HTTPServiceRequestQueues []perflibHTTPServiceRequestQueues
 
-	if err := unmarshalObject(ctx.perfObjects["HTTP Service Request Queues"], &HTTPServiceRequestQueues); err != nil {
+	if err := unmarshalObject(ctx.perfObjects["HTTP Service Request Queues"], &HTTPServiceRequestQueues, c.logger); err != nil {
 		return nil, err
 	}
 
