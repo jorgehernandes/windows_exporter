@@ -152,7 +152,7 @@ var collectors = []collectorInit{
 				"APP_POOL_WAS",
 				"Web Service Cache",
 				"W3SVC_W3WP",
-				"HTTP Service Request Queues"
+				"HTTP Service Request Queues",
 			}
 		},
 	},
