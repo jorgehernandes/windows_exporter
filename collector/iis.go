@@ -2110,14 +2110,14 @@ func (c *IISCollector) collectWebServiceCache(ctx *ScrapeContext, ch chan<- prom
 type perflibHTTPServiceRequestQueues struct {
 	Name string
 
-	CurrentQueueSize float64 `perflib:"TamanhodaFilaAtual"`
-	RejectedRequests float64 `perflib:"SolicitaçõesRejeitadas"`
+	CurrentQueueSize float64 `perflib:"CurrentQueueSize"`
+	RejectedRequests float64 `perflib:"RejectedRequests"`
 }
 
 func (c *IISCollector) collectHTTPServiceRequestQueuesP(ctx *ScrapeContext, ch chan<- prometheus.Metric) (*prometheus.Desc, error) {
 	var HTTPServiceRequestQueues []perflibHTTPServiceRequestQueues
 
-	if err := unmarshalObject(ctx.perfObjects["Filas de Solicitações do Serviço HTTP"], &HTTPServiceRequestQueues, c.logger); err != nil {
+	if err := unmarshalObject(ctx.perfObjects["HTTP Service Request Queues"], &HTTPServiceRequestQueues, c.logger); err != nil {
 		return nil, err
 	}
 
