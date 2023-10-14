@@ -916,15 +916,17 @@ func newIISCollector(logger log.Logger) (Collector, error) {
 			nil,
 			nil,
 		),
+
+		//HTTP Service Request Queues
 		RequestQueues_CurrentQueueSize: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "http_requests_current_queue"),
-			"",
+			"Number of Current Queue Size",
 			[]string{"app"},
 			nil,
 		),
 		RequestQueues_RejectedRequest: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "http_requests_rejected_total"),
-			"",
+			"Total number of requests rejected",
 			[]string{"app"},
 			nil,
 		),
@@ -2108,14 +2110,14 @@ func (c *IISCollector) collectWebServiceCache(ctx *ScrapeContext, ch chan<- prom
 type perflibHTTPServiceRequestQueues struct {
 	Name string
 
-	CurrentQueueSize float64 `perflib:"CurrentQueueSize"`
-	RejectedRequests float64 `perflib:"RejectedRequests"`
+	CurrentQueueSize float64 `perflib:"TamanhodaFilaAtual"`
+	RejectedRequests float64 `perflib:"SolicitaçõesRejeitadas"`
 }
 
 func (c *IISCollector) collectHTTPServiceRequestQueuesP(ctx *ScrapeContext, ch chan<- prometheus.Metric) (*prometheus.Desc, error) {
 	var HTTPServiceRequestQueues []perflibHTTPServiceRequestQueues
 
-	if err := unmarshalObject(ctx.perfObjects["HTTP Service Request Queues"], &HTTPServiceRequestQueues, c.logger); err != nil {
+	if err := unmarshalObject(ctx.perfObjects["Filas de Solicitações do Serviço HTTP"], &HTTPServiceRequestQueues, c.logger); err != nil {
 		return nil, err
 	}
 
