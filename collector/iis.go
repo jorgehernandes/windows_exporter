@@ -2122,6 +2122,10 @@ func (c *IISCollector) collectHTTPServiceRequestQueuesP(ctx *ScrapeContext, ch c
 	}
 
 	for _, app := range HTTPServiceRequestQueues {
+		if c.appExcludePattern.MatchString(app.Name) ||
+			!c.appIncludePattern.MatchString(app.Name) {
+			continue
+		}
 
 		ch <- prometheus.MustNewConstMetric(
 			c.RequestQueues_CurrentQueueSize,
