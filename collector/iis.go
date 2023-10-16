@@ -215,7 +215,6 @@ type IISCollector struct {
 	//HTTP Service Request Queues
 	RequestQueues_CacheHitRate     *prometheus.Desc
 	RequestQueues_RejectedRequest  *prometheus.Desc
-	RequestQueues_RejectionRate    *prometheus.Desc
 	RequestQueues_ArrivalRate      *prometheus.Desc
 	RequestQueues_MaxQueueItemAge  *prometheus.Desc
 	RequestQueues_CurrentQueueSize *prometheus.Desc
@@ -931,12 +930,6 @@ func newIISCollector(logger log.Logger) (Collector, error) {
 		RequestQueues_RejectedRequest: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "queue_rejected_requests"),
 			"Total number of requests in this application pool's queue that were rejected",
-			[]string{"app"},
-			nil,
-		),
-		RequestQueues_RejectionRate: prometheus.NewDesc(
-			prometheus.BuildFQName(Namespace, subsystem, "queue_rejection_rate"),
-			"Rate at which this application pool rejected requests in the queue",
 			[]string{"app"},
 			nil,
 		),
@@ -2140,7 +2133,6 @@ type perflibHTTPServiceRequestQueues struct {
 
 	CacheHitRate     float64 `perflib:"CacheHitRate"`
 	RejectedRequests float64 `perflib:"RejectedRequests"`
-	RejectionRate    float64 `perflib:"RejectionRate"`
 	ArrivalRate      float64 `perflib:"ArrivalRate"`
 	MaxQueueItemAge  float64 `perflib:"MaxQueueItemAge"`
 	CurrentQueueSize float64 `perflib:"CurrentQueueSize"`
@@ -2170,13 +2162,6 @@ func (c *IISCollector) collectHTTPServiceRequestQueuesP(ctx *ScrapeContext, ch c
 			c.RequestQueues_RejectedRequest,
 			prometheus.CounterValue,
 			app.RejectedRequests,
-			app.Name,
-		)
-
-		ch <- prometheus.MustNewConstMetric(
-			c.RequestQueues_RejectionRate,
-			prometheus.GaugeValue,
-			app.RejectionRate,
 			app.Name,
 		)
 
