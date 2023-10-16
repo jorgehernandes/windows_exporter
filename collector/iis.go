@@ -942,7 +942,7 @@ func newIISCollector(logger log.Logger) (Collector, error) {
 		),
 		RequestQueues_ArrivalRate: prometheus.NewDesc(
 			prometheus.BuildFQName(Namespace, subsystem, "queue_arrival_rate"),
-			"Rate at which requests are arriving in the request queue of this application pool",
+			"Total number of requests are arriving in the queue of this application pool",
 			[]string{"app"},
 			nil,
 		),
@@ -2182,7 +2182,7 @@ func (c *IISCollector) collectHTTPServiceRequestQueuesP(ctx *ScrapeContext, ch c
 
 		ch <- prometheus.MustNewConstMetric(
 			c.RequestQueues_ArrivalRate,
-			prometheus.GaugeValue,
+			prometheus.CounterValue,
 			app.ArrivalRate,
 			app.Name,
 		)
