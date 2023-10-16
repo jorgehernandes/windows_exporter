@@ -1,7 +1,7 @@
 go:
     version: 1.20
 repository:
-    path: github.com/prometheus-community/windows_exporter
+    path: github.com/jorgehernandes/windows_exporter
 build:
     binaries:
         - name: windows_exporter

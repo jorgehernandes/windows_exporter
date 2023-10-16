@@ -21,7 +21,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/prometheus-community/windows_exporter/collector"
+	"github.com/jorgehernandes/windows_exporter/collector"
 	"github.com/prometheus-community/windows_exporter/config"
 	"github.com/prometheus-community/windows_exporter/log/flag"
 	"github.com/yusufpapurcu/wmi"
