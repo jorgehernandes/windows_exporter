@@ -213,8 +213,12 @@ type IISCollector struct {
 	ServiceCache_OutputCacheFlushesTotal       *prometheus.Desc
 
 	//HTTP Service Request Queues
-	RequestQueues_CurrentQueueSize *prometheus.Desc
+	RequestQueues_CacheHitRate     *prometheus.Desc
 	RequestQueues_RejectedRequest  *prometheus.Desc
+	RequestQueues_RejectionRate    *prometheus.Desc
+	RequestQueues_ArrivalRate      *prometheus.Desc
+	RequestQueues_MaxQueueItemAge  *prometheus.Desc
+	RequestQueues_CurrentQueueSize *prometheus.Desc
 
 	appIncludePattern *regexp.Regexp
 	appExcludePattern *regexp.Regexp
@@ -918,15 +922,39 @@ func newIISCollector(logger log.Logger) (Collector, error) {
 		),
 
 		//HTTP Service Request Queues
-		RequestQueues_CurrentQueueSize: prometheus.NewDesc(
-			prometheus.BuildFQName(Namespace, subsystem, "http_requests_current_queue"),
-			"Number of Current Queue Size",
+		RequestQueues_CacheHitRate: prometheus.NewDesc(
+			prometheus.BuildFQName(Namespace, subsystem, "queue_cache_hit_rate"),
+			"Rate of cache hits from the queue of this application pool",
 			[]string{"app"},
 			nil,
 		),
 		RequestQueues_RejectedRequest: prometheus.NewDesc(
-			prometheus.BuildFQName(Namespace, subsystem, "http_requests_rejected_total"),
-			"Total number of requests rejected",
+			prometheus.BuildFQName(Namespace, subsystem, "queue_rejected_requests"),
+			"Total number of requests in this application pool's queue that were rejected",
+			[]string{"app"},
+			nil,
+		),
+		RequestQueues_RejectionRate: prometheus.NewDesc(
+			prometheus.BuildFQName(Namespace, subsystem, "queue_rejection_rate"),
+			"Rate at which this application pool rejected requests in the queue",
+			[]string{"app"},
+			nil,
+		),
+		RequestQueues_ArrivalRate: prometheus.NewDesc(
+			prometheus.BuildFQName(Namespace, subsystem, "queue_arrival_rate"),
+			"Rate at which requests are arriving in the request queue of this application pool",
+			[]string{"app"},
+			nil,
+		),
+		RequestQueues_MaxQueueItemAge: prometheus.NewDesc(
+			prometheus.BuildFQName(Namespace, subsystem, "queue_max_item_age"),
+			"The age of the oldest request in the queue",
+			[]string{"app"},
+			nil,
+		),
+		RequestQueues_CurrentQueueSize: prometheus.NewDesc(
+			prometheus.BuildFQName(Namespace, subsystem, "queue_current_size"),
+			"Number of items current present in queue",
 			[]string{"app"},
 			nil,
 		),
@@ -2110,8 +2138,12 @@ func (c *IISCollector) collectWebServiceCache(ctx *ScrapeContext, ch chan<- prom
 type perflibHTTPServiceRequestQueues struct {
 	Name string
 
-	CurrentQueueSize float64 `perflib:"CurrentQueueSize"`
+	CacheHitRate     float64 `perflib:"CacheHitRate"`
 	RejectedRequests float64 `perflib:"RejectedRequests"`
+	RejectionRate    float64 `perflib:"RejectionRate"`
+	ArrivalRate      float64 `perflib:"ArrivalRate"`
+	MaxQueueItemAge  float64 `perflib:"MaxQueueItemAge"`
+	CurrentQueueSize float64 `perflib:"CurrentQueueSize"`
 }
 
 func (c *IISCollector) collectHTTPServiceRequestQueuesP(ctx *ScrapeContext, ch chan<- prometheus.Metric) (*prometheus.Desc, error) {
@@ -2128,9 +2160,9 @@ func (c *IISCollector) collectHTTPServiceRequestQueuesP(ctx *ScrapeContext, ch c
 		}
 
 		ch <- prometheus.MustNewConstMetric(
-			c.RequestQueues_CurrentQueueSize,
+			c.RequestQueues_CacheHitRate,
 			prometheus.GaugeValue,
-			app.CurrentQueueSize,
+			app.CacheHitRate,
 			app.Name,
 		)
 
@@ -2138,6 +2170,34 @@ func (c *IISCollector) collectHTTPServiceRequestQueuesP(ctx *ScrapeContext, ch c
 			c.RequestQueues_RejectedRequest,
 			prometheus.CounterValue,
 			app.RejectedRequests,
+			app.Name,
+		)
+
+		ch <- prometheus.MustNewConstMetric(
+			c.RequestQueues_RejectionRate,
+			prometheus.GaugeValue,
+			app.RejectionRate,
+			app.Name,
+		)
+
+		ch <- prometheus.MustNewConstMetric(
+			c.RequestQueues_ArrivalRate,
+			prometheus.GaugeValue,
+			app.ArrivalRate,
+			app.Name,
+		)
+
+		ch <- prometheus.MustNewConstMetric(
+			c.RequestQueues_MaxQueueItemAge,
+			prometheus.GaugeValue,
+			app.MaxQueueItemAge,
+			app.Name,
+		)
+
+		ch <- prometheus.MustNewConstMetric(
+			c.RequestQueues_CurrentQueueSize,
+			prometheus.GaugeValue,
+			app.CurrentQueueSize,
 			app.Name,
 		)
 	}
